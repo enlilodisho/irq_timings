@@ -21,6 +21,7 @@
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/gpio.h>
+#include <linux/interrupt.h>
 
 MODULE_AUTHOR("Enlil Odisho <github@enlilodisho.com>");
 MODULE_DESCRIPTION("Driver for measuring time between interrupts on gpio pins.");
@@ -37,6 +38,7 @@ static struct class driver_class;
 /* struct representing gpio data */
 static struct gpio_data {
     struct class_attribute class_attr_gpio;
+    unsigned int irq_number;
     unsigned int writeBuf[BUFFER_SIZE];
     size_t writeI;
 } *registered_gpios[GPIO_COUNT];
@@ -49,6 +51,13 @@ static void free_gpio_data(size_t gpio)
         kfree(registered_gpios[gpio]);
         registered_gpios[gpio] = NULL;
     }
+}
+
+static irq_handler_t gpio_irq_handler(unsigned int irq, void* dev_id,
+        struct pt_regs* regs)
+{
+    printk(KERN_INFO "irq_timings: gpio_irq_handler called (irq:%u)\n", irq);
+    return (irq_handler_t) IRQ_HANDLED;
 }
 
 /**
@@ -103,8 +112,7 @@ static ssize_t register_store(struct class* class,
     if (gpio_direction_input(gpio) < 0)
     {
         printk(KERN_ERR "error setting gpio %lu as input\n", gpio);
-        gpio_free(gpio);
-        return -1;
+        goto GpioDirectionSetupError;
     }
 
     // create struct gpio_data obj for this gpio pin
@@ -122,12 +130,31 @@ static ssize_t register_store(struct class* class,
     if (class_create_file(&driver_class, &registered_gpios[gpio]->class_attr_gpio) < 0)
     {
         printk(KERN_ERR "error creating gpio%lu class attribute file\n", gpio);
-        gpio_free(gpio);
-        free_gpio_data(gpio);
-        return -1;
+        goto GpioClassAttributeFileError;
+    }
+
+    // setup interrupt
+    registered_gpios[gpio]->irq_number = gpio_to_irq(gpio);
+    if (request_irq(registered_gpios[gpio]->irq_number,
+                (irq_handler_t) gpio_irq_handler,
+                IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
+                class_attr_name, registered_gpios[gpio]) < 0)
+    {
+        printk(KERN_ERR "error setting up interrupt on gpio %lu\n", gpio);
+        goto GpioInterruptSetupError;
     }
 
     return count;
+
+    /* handler cleanup after error */
+GpioInterruptSetupError:
+    class_remove_file(&driver_class, &registered_gpios[gpio]->class_attr_gpio);
+GpioClassAttributeFileError:
+    free_gpio_data(gpio);
+GpioDirectionSetupError:
+    gpio_free(gpio);
+    // return -1 to mark error status
+    return -1;
 }
 
 /**
@@ -159,6 +186,9 @@ static ssize_t unregister_store(struct class* class,
         printk(KERN_ERR "gpio %lu is not registered\n", gpio);
         return -1;
     }
+
+    // remove gpio interrupt
+    free_irq(registered_gpios[gpio]->irq_number, registered_gpios[gpio]);
 
     // remove gpio class attribute file
     class_remove_file(&driver_class, &registered_gpios[gpio]->class_attr_gpio);
@@ -226,6 +256,7 @@ static void __exit irqts_exit(void)
     {
         if (registered_gpios[i] != NULL)
         {
+            free_irq(registered_gpios[i]->irq_number, registered_gpios[i]);
             class_remove_file(&driver_class, &registered_gpios[i]->class_attr_gpio);
             gpio_free(i);
             free_gpio_data(i);
