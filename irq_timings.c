@@ -12,8 +12,11 @@
 
 #define CLASS_NAME      "irq_timings"
 #define GPIO_COUNT      100     // only first {GPIO_COUNT} pins will be supported
-#define BUFFER_SIZE     1024    // size of buffer for timings
-#define CLASS_ATTR_PERM 0220    // permissions for class attribute files
+#define BUFFER_SIZE     512     // size of buffer for char* timings (max = PAGE_SIZE)
+#define MAX_READ_QUEUE_SIZE 10  // max number of timings in read queue
+#define PERM_WO         0220 // write-only permissions
+#define PERM_RO         0440 // read-only permissions
+#define GPIO_ATTR_PREFIX  "gpio"
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -22,51 +25,189 @@
 #include <linux/device.h>
 #include <linux/gpio.h>
 #include <linux/interrupt.h>
+#include <linux/mutex.h>
+
+#if BUFFER_SIZE > PAGE_SIZE
+#undef  BUFFER_SIZE
+#define BUFFER_SIZE     PAGE_SIZE
+#endif
+
+#define CEILING(x,y)    (((x) + (y) - 1) / (y))
+#define TIMINGS_COUNT   ((BUFFER_SIZE / 4) - CEILING((BUFFER_SIZE / 4), 4))
 
 MODULE_AUTHOR("Enlil Odisho <github@enlilodisho.com>");
 MODULE_DESCRIPTION("Driver for measuring time between interrupts on gpio pins.");
 MODULE_LICENSE("GPL");
 
-static const unsigned long CLASS_ATTR_NAME_SIZE = sizeof("gpio") + sizeof(GPIO_COUNT);
+static const unsigned long GPIO_ATTR_NAME_SIZE = sizeof(GPIO_ATTR_PREFIX)
+                                                    + sizeof(GPIO_COUNT);
 
 #define CLASS_ATTR_WRITE(_name) \
-    struct class_attribute class_attr_##_name = __ATTR(_name, CLASS_ATTR_PERM, \
+    struct class_attribute class_attr_##_name = __ATTR(_name, PERM_WO, \
                                                        NULL, _name##_store)
 /* struct representing driver_class. defined below */
 static struct class driver_class;
+
+/* struct representing node in ReadQueue */
+static struct TimingsNode {
+    unsigned int* timings;
+    struct TimingsNode* next;
+};
 
 /* struct representing gpio data */
 static struct gpio_data {
     struct class_attribute class_attr_gpio;
     unsigned int irq_number;
-    unsigned int writeBuf[BUFFER_SIZE];
+    unsigned int* writeBuf;
     size_t writeI;
+    
+    // read queue
+    struct TimingsNode* readQueue_head;
+    struct TimingsNode* readQueue_tail;
+    size_t readQueueSize;
+    struct mutex readQueueLock;
 } *registered_gpios[GPIO_COUNT];
 
 static void free_gpio_data(size_t gpio)
 {
+    struct TimingsNode *currentTimingsNode, *nextTimingsNode;
+    
     if (registered_gpios[gpio] != NULL)
     {
+        // Delete everything from read queue
+        currentTimingsNode = registered_gpios[gpio]->readQueue_head;
+        while (currentTimingsNode != NULL)
+        {
+            nextTimingsNode = currentTimingsNode->next;
+            kfree(currentTimingsNode->timings);
+            kfree(currentTimingsNode);
+            currentTimingsNode = nextTimingsNode;
+        }
+
+        kfree(registered_gpios[gpio]->writeBuf);
         kfree(registered_gpios[gpio]->class_attr_gpio.attr.name);
         kfree(registered_gpios[gpio]);
         registered_gpios[gpio] = NULL;
     }
 }
 
-static irq_handler_t gpio_irq_handler(unsigned int irq, void* dev_id,
+static irq_handler_t gpio_irq_handler(unsigned int irq, void* data,
         struct pt_regs* regs)
 {
-    printk(KERN_INFO "irq_timings: gpio_irq_handler called (irq:%u)\n", irq);
+    struct gpio_data* gpio_data = (struct gpio_data*) data;
+    struct TimingsNode* timingsNode;
+    //printk(KERN_INFO "irq_timings: gpio_irq_handler called (irq:%u)\n", irq);
+
+    //printk(KERN_INFO "writeI: %u\n", gpio_data->writeI);
+    gpio_data->writeBuf[gpio_data->writeI] = 1;
+    // if write buffer filled, move to read queue and allocate new write buf
+    if (++gpio_data->writeI >= TIMINGS_COUNT)
+    {
+        // create new read queue entry
+        timingsNode = kmalloc(sizeof(struct TimingsNode), GFP_KERNEL);
+        timingsNode->timings = gpio_data->writeBuf;
+        timingsNode->next = NULL;
+        // create new write buf
+        gpio_data->writeBuf = kmalloc(TIMINGS_COUNT * sizeof(unsigned int),
+                GFP_KERNEL);
+        gpio_data->writeI = 0;
+        // add read queue entry to read queue
+        if (mutex_lock_interruptible(&gpio_data->readQueueLock) < 0)
+        {
+            // TODO no restart?
+            kfree(timingsNode->timings);
+            kfree(timingsNode);
+
+            return (irq_handler_t) IRQ_HANDLED;
+        }
+        if (gpio_data->readQueue_head == NULL)
+        {
+            gpio_data->readQueue_head = timingsNode;
+            gpio_data->readQueue_tail = timingsNode;
+        }
+        else
+        {
+            gpio_data->readQueue_tail->next = timingsNode;
+            gpio_data->readQueue_tail = timingsNode;
+        }
+        // remove head of queue if queue is full
+        if (++gpio_data->readQueueSize >= MAX_READ_QUEUE_SIZE)
+        {
+            timingsNode = gpio_data->readQueue_head->next;
+            kfree(gpio_data->readQueue_head->timings);
+            kfree(gpio_data->readQueue_head);
+            gpio_data->readQueue_head = timingsNode;
+        }
+        mutex_unlock(&gpio_data->readQueueLock);
+    }
     return (irq_handler_t) IRQ_HANDLED;
 }
 
 /**
  * Invoked when read from /sys/class/{CLASS_NAME}/gpio{GPIO_ID}
  */
-static ssize_t gpio_show(struct class* class, struct class_attribute* attr,
+static ssize_t gpio_show(struct class* class, struct class_attribute* class_attr,
         char* buf)
 {
-    return 0;
+    char gpio_id_chararr[sizeof(GPIO_COUNT)];
+    unsigned long gpio;
+    struct TimingsNode* timingsNode;
+    size_t bufI;
+
+    // get gpio id
+    snprintf(gpio_id_chararr, sizeof(GPIO_COUNT), "%s",
+            (class_attr->attr.name + (sizeof(GPIO_ATTR_PREFIX) - 1)));
+    if (kstrtoul(gpio_id_chararr, 10, &gpio) < 0)
+    {
+        printk(KERN_ERR "irq_timings: failed to retrieve gpio id\n");
+        return -1;
+    }
+    
+    if (registered_gpios[gpio] == NULL)
+    {
+        printk(KERN_ERR "irq_timings: failed to retrieve gpio data\n");
+        return -1;
+    }
+
+    // retrieve the first timings from the queue
+    if (mutex_lock_interruptible(&registered_gpios[gpio]->readQueueLock) < 0)
+    {
+        return -ERESTARTSYS;
+    }
+    if (registered_gpios[gpio]->readQueue_head == NULL)
+    {
+        mutex_unlock(&registered_gpios[gpio]->readQueueLock);
+        return 0;
+    }
+    timingsNode = registered_gpios[gpio]->readQueue_head;
+    if (registered_gpios[gpio]->readQueue_tail == timingsNode)
+    {
+        registered_gpios[gpio]->readQueue_head = NULL;
+        registered_gpios[gpio]->readQueue_tail = NULL;
+    }
+    else
+    {
+        registered_gpios[gpio]->readQueue_head = timingsNode->next;
+    }
+    registered_gpios[gpio]->readQueueSize--;
+    mutex_unlock(&registered_gpios[gpio]->readQueueLock);
+
+    // TODO print timings
+    for (bufI = 0; bufI < TIMINGS_COUNT; bufI++)
+    {
+        if (bufI > 0)
+        {
+            buf[(bufI * 5) - 1] = ',';
+        }
+        snprintf((buf + (bufI * 5)), 4, "%u", timingsNode->timings[bufI]);
+    }
+    buf[(TIMINGS_COUNT * 5) - 1] = '\n';
+
+    // TODO free timings node
+    kfree(timingsNode->timings);
+    kfree(timingsNode);
+
+    return BUFFER_SIZE;
 }
 
 /**
@@ -117,13 +258,19 @@ static ssize_t register_store(struct class* class,
 
     // create struct gpio_data obj for this gpio pin
     gpioData = kmalloc(sizeof(struct gpio_data), GFP_KERNEL);
-    class_attr_name = kmalloc(CLASS_ATTR_NAME_SIZE, GFP_KERNEL);
-    snprintf(class_attr_name, CLASS_ATTR_NAME_SIZE, "gpio%lu", gpio);
+    class_attr_name = kmalloc(GPIO_ATTR_NAME_SIZE, GFP_KERNEL);
+    snprintf(class_attr_name, GPIO_ATTR_NAME_SIZE, "%s%lu",
+            GPIO_ATTR_PREFIX, gpio);
     gpioData->class_attr_gpio.attr = (struct attribute) { class_attr_name,
-                                    VERIFY_OCTAL_PERMISSIONS(CLASS_ATTR_PERM) };
+                                    VERIFY_OCTAL_PERMISSIONS(PERM_RO) };
     gpioData->class_attr_gpio.show = gpio_show;
     gpioData->class_attr_gpio.store = NULL;
+    gpioData->writeBuf = kmalloc(TIMINGS_COUNT * sizeof(unsigned int), GFP_KERNEL);
     gpioData->writeI = 0;
+    gpioData->readQueue_head = NULL;
+    gpioData->readQueue_tail = NULL;
+    gpioData->readQueueSize = 0;
+    mutex_init(&gpioData->readQueueLock);
     registered_gpios[gpio] = gpioData;
 
     // add gpio class attribute file
