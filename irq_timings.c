@@ -10,9 +10,10 @@
  * October 2021
  */
 
-#define CLASS_NAME          "irq_timings"
-#define GPIO_COUNT          100     // only first {GPIO_COUNT} pins will be supported
-#define BUFFER_SIZE         1024    // size of buffer for timings
+#define CLASS_NAME      "irq_timings"
+#define GPIO_COUNT      100     // only first {GPIO_COUNT} pins will be supported
+#define BUFFER_SIZE     1024    // size of buffer for timings
+#define CLASS_ATTR_PERM 0220    // permissions for class attribute files
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -25,14 +26,39 @@ MODULE_AUTHOR("Enlil Odisho <github@enlilodisho.com>");
 MODULE_DESCRIPTION("Driver for measuring time between interrupts on gpio pins.");
 MODULE_LICENSE("GPL");
 
-#define CLASS_ATTR_WRITE(_name) \
-    struct class_attribute class_attr_##_name = __ATTR(_name, 0220, NULL, _name##_store)
+static const unsigned long CLASS_ATTR_NAME_SIZE = sizeof("gpio") + sizeof(GPIO_COUNT);
 
+#define CLASS_ATTR_WRITE(_name) \
+    struct class_attribute class_attr_##_name = __ATTR(_name, CLASS_ATTR_PERM, \
+                                                       NULL, _name##_store)
+/* struct representing driver_class. defined below */
+static struct class driver_class;
+
+/* struct representing gpio data */
 static struct gpio_data {
+    struct class_attribute class_attr_gpio;
     unsigned int writeBuf[BUFFER_SIZE];
     size_t writeI;
 } *registered_gpios[GPIO_COUNT];
-//static struct gpio_data* registered_gpios[GPIO_COUNT] = {NULL};
+
+static void free_gpio_data(size_t gpio)
+{
+    if (registered_gpios[gpio] != NULL)
+    {
+        kfree(registered_gpios[gpio]->class_attr_gpio.attr.name);
+        kfree(registered_gpios[gpio]);
+        registered_gpios[gpio] = NULL;
+    }
+}
+
+/**
+ * Invoked when read from /sys/class/{CLASS_NAME}/gpio{GPIO_ID}
+ */
+static ssize_t gpio_show(struct class* class, struct class_attribute* attr,
+        char* buf)
+{
+    return 0;
+}
 
 /**
  * Invoked when write to /sys/class/{CLASS_NAME}/register attribute file.
@@ -42,6 +68,7 @@ static ssize_t register_store(struct class* class,
 {
     unsigned long gpio;
     struct gpio_data* gpioData;
+    char* class_attr_name;
     printk(KERN_INFO "irq_timings: register store called\n");
 
     // read gpio pin from input
@@ -80,9 +107,25 @@ static ssize_t register_store(struct class* class,
         return -1;
     }
 
+    // create struct gpio_data obj for this gpio pin
     gpioData = kmalloc(sizeof(struct gpio_data), GFP_KERNEL);
+    class_attr_name = kmalloc(CLASS_ATTR_NAME_SIZE, GFP_KERNEL);
+    snprintf(class_attr_name, CLASS_ATTR_NAME_SIZE, "gpio%lu", gpio);
+    gpioData->class_attr_gpio.attr = (struct attribute) { class_attr_name,
+                                    VERIFY_OCTAL_PERMISSIONS(CLASS_ATTR_PERM) };
+    gpioData->class_attr_gpio.show = gpio_show;
+    gpioData->class_attr_gpio.store = NULL;
     gpioData->writeI = 0;
     registered_gpios[gpio] = gpioData;
+
+    // add gpio class attribute file
+    if (class_create_file(&driver_class, &registered_gpios[gpio]->class_attr_gpio) < 0)
+    {
+        printk(KERN_ERR "error creating gpio%lu class attribute file\n", gpio);
+        gpio_free(gpio);
+        free_gpio_data(gpio);
+        return -1;
+    }
 
     return count;
 }
@@ -117,12 +160,14 @@ static ssize_t unregister_store(struct class* class,
         return -1;
     }
 
+    // remove gpio class attribute file
+    class_remove_file(&driver_class, &registered_gpios[gpio]->class_attr_gpio);
+
     // free gpio pin
     gpio_free(gpio);
 
-    // remove gpio data from registered_gpios
-    kfree(registered_gpios[gpio]);
-    registered_gpios[gpio] = NULL;
+    // free and remove gpio data from registered_gpios
+    free_gpio_data(gpio);
 
     return count;
 }
@@ -145,6 +190,7 @@ static struct class driver_class = {
     .owner          = THIS_MODULE,
     .class_groups   = irq_timings_class_groups
 };
+
 
 /**
  * Invoked when module is added to kernel.
@@ -180,8 +226,9 @@ static void __exit irqts_exit(void)
     {
         if (registered_gpios[i] != NULL)
         {
-            kfree(registered_gpios[i]);
-            registered_gpios[i] = NULL;
+            class_remove_file(&driver_class, &registered_gpios[i]->class_attr_gpio);
+            gpio_free(i);
+            free_gpio_data(i);
         }
     }
     class_destroy(&driver_class);
