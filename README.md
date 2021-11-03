@@ -22,4 +22,49 @@ the timings in a kernel module rather than in a userspace program. This provides
 more accurate timing data from the sensor which your userspace program can 
 retrieve.
 
+## Build & Install
+
+To build kernel module:
+```
+make
+```
+
+To install kernel module after building:
+```
+make install
+```
+
+To uninstall kernel module:
+```
+make uninstall
+```
+
+## Usage
+
+#### Step 1: Registering a GPIO Pin
+
+To attach an interrupt to a gpio pin and compute the timings between interrupts,
+you will need to register the gpio pin with the irq_timings kernel module.
+```
+echo "PIN_NUMBER" > /sys/class/irq_timings/register
+```
+
+#### Step 2: Reading the timings for a registered gpio pin
+
+For each registered gpio pin, there will be a corresponding file created in
+`/sys/class/irq_timings/` with the name `gpio + PIN_NUMBER`. Reading from this
+file will display the last timings collected for the gpio pin.
+
+#### Example for registering and reading timings from gpio pin 16
+```
+echo "16" > /sys/class/irq_timings/register
+cat /sys/class/irq_timings/gpio16
+```
+
+##### Unregistering a pin
+
+To remove the interrupt and stop collecting timings for a gpio pin:
+```
+echo "PIN_NUMBER" > /sys/class/irq_timings/unregister
+```
 
